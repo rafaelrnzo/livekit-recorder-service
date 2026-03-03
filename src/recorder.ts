@@ -2,8 +2,11 @@ import puppeteer, { Browser } from "puppeteer";
 import { spawn } from "child_process";
 import ffmpegStatic from "ffmpeg-static";
 import { uploadStream } from "./storage";
+import fs from "fs";
+import path from "path";
 
-export const activeSessions = new Map<string, { browser: Browser, wsServer: any, ffmpeg: any }>();
+export const activeSessions = new Map<string, { browser: Browser, wsServer: any, outputName: string, webmPath: string, fileStream: fs.WriteStream }>();
+export const extractionProgress = new Map<string, { status: string, progress: number }>();
 
 export async function startRecording(roomId: string, roomUrl: string, outputName: string) {
     const browser = await puppeteer.launch({
@@ -27,22 +30,16 @@ export async function startRecording(roomId: string, roomUrl: string, outputName
     // We give the meeting room 5 seconds to load participants properly
     await new Promise(r => setTimeout(r, 5000));
 
-    const ffmpegPath = ffmpegStatic || "ffmpeg";
+    // Determine temporary path for webm stream
+    const tempDir = process.env.TEMP_DIR || "/tmp";
+    if (!fs.existsSync(tempDir)) {
+        fs.mkdirSync(tempDir, { recursive: true });
+    }
+    const webmPath = path.join(tempDir, `${outputName}.webm`);
+    const fileStream = fs.createWriteStream(webmPath);
 
-    const ffmpeg = spawn(ffmpegPath, [
-        "-f", "webm",
-        "-i", "pipe:0",
-        "-c:v", "libx264",
-        "-preset", "veryfast",
-        "-movflags", "frag_keyframe+empty_moov",
-        "-f", "mp4",
-        "pipe:1",
-    ]);
-
-    // upload ffmpeg stdout to MinIO
-    uploadStream(outputName, ffmpeg.stdout);
-
-    ffmpeg.stderr.on("data", (d) => console.log(d.toString()));
+    // Initial progress setup
+    extractionProgress.set(outputName, { status: "RECORDING", progress: 0 });
 
     // Start a local WebSocket Server on a random port to receive video chunks
     const wsServer = Bun.serve({
@@ -54,11 +51,11 @@ export async function startRecording(roomId: string, roomUrl: string, outputName
         websocket: {
             message(ws, message) {
                 if (Buffer.isBuffer(message)) {
-                    ffmpeg.stdin.write(message);
+                    fileStream.write(message);
                 }
             },
             close(ws) {
-                ffmpeg.stdin.end();
+                fileStream.end();
             }
         }
     });
@@ -102,13 +99,10 @@ export async function startRecording(roomId: string, roomUrl: string, outputName
         }
     }, wsPort);
 
-    activeSessions.set(roomId, { browser, wsServer, ffmpeg });
-
-    // You might want to handle when recording stops (e.g. from the page or a timer)
-    // For now, it records until the server dies, the browser page is closed, or stopRecording is called.
+    activeSessions.set(roomId, { browser, wsServer, outputName, webmPath, fileStream });
 }
 
-export async function stopRecording(roomId: string) {
+export async function stopRecording(roomId: string): Promise<string> {
     const session = activeSessions.get(roomId);
     if (!session) {
         throw new Error(`No active recording found for room ${roomId}`);
@@ -130,19 +124,89 @@ export async function stopRecording(roomId: string) {
             await session.browser.close().catch(() => { });
         }
 
-        // Safely end WebSockets and FFmpeg stdin
+        // Safely end WebSockets and file streams
         try {
             session.wsServer.stop();
         } catch (e) { }
 
         try {
-            session.ffmpeg.stdin.end();
+            session.fileStream.end();
         } catch (e) { }
 
         activeSessions.delete(roomId);
-        console.log(`[Recorder] Session ${roomId} stopped successfully.`);
+        console.log(`[Recorder] Session ${roomId} capture stopped successfully. Triggering background extraction.`);
+
+        // Start background FFmpeg task
+        extractionProgress.set(session.outputName, { status: "PROCESSING", progress: 0 });
+        processBackgroundVideo(session.webmPath, session.outputName);
+
+        return session.outputName;
     } catch (e) {
         console.error(`Failed to completely stop recording for ${roomId}`, e);
         throw e;
     }
+}
+
+async function processBackgroundVideo(webmPath: string, outputName: string) {
+    const ffmpegPath = ffmpegStatic || "ffmpeg";
+
+    // First get duration for progress calculation
+    const ffprobe = spawn(ffmpegPath, [
+        "-i", webmPath,
+    ]);
+
+    let durationInSecs = 0;
+    ffprobe.stderr.on("data", (data) => {
+        const str = data.toString();
+        // Look for Duration: 00:00:00.00
+        const match = str.match(/Duration: (\d{2}):(\d{2}):(\d{2}\.\d{2})/);
+        if (match) {
+            const hours = parseFloat(match[1]);
+            const minutes = parseFloat(match[2]);
+            const seconds = parseFloat(match[3]);
+            durationInSecs = hours * 3600 + minutes * 60 + seconds;
+        }
+    });
+
+    await new Promise(r => ffprobe.on("close", r));
+
+    console.log(`[FFMPEG] Starting extraction for ${outputName}. Duration calculated: ${durationInSecs}s`);
+
+    const ffmpeg = spawn(ffmpegPath, [
+        "-f", "webm",
+        "-i", webmPath,
+        "-c:v", "libx264",
+        "-preset", "veryfast",
+        "-movflags", "frag_keyframe+empty_moov",
+        "-f", "mp4",
+        "pipe:1",
+    ]);
+
+    // Upload ffmpeg stdout directly to MinIO
+    uploadStream(outputName, ffmpeg.stdout).then(() => {
+        console.log(`[FFMPEG] Finished uploading ${outputName} to MinIO.`);
+        extractionProgress.set(outputName, { status: "COMPLETED", progress: 100 });
+        // Clean up temp file
+        fs.unlink(webmPath, () => { });
+    }).catch(err => {
+        console.error(`[FFMPEG] Failed to upload ${outputName} to MinIO`, err);
+        extractionProgress.set(outputName, { status: "ERROR", progress: 0 });
+    });
+
+    ffmpeg.stderr.on("data", (data) => {
+        const str = data.toString();
+        // Look for time=00:00:00.00
+        const match = str.match(/time=(\d{2}):(\d{2}):(\d{2}\.\d{2})/);
+        if (match && durationInSecs > 0) {
+            const hours = parseFloat(match[1]);
+            const minutes = parseFloat(match[2]);
+            const seconds = parseFloat(match[3]);
+            const currentTime = hours * 3600 + minutes * 60 + seconds;
+            const percentage = Math.floor((currentTime / durationInSecs) * 100);
+
+            // Just incase it goes weird, cap it at 99. The upload promise closing will set to 100.
+            const safeProgress = Math.min(percentage, 99);
+            extractionProgress.set(outputName, { status: "PROCESSING", progress: safeProgress });
+        }
+    });
 }

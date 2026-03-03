@@ -6,8 +6,10 @@ const corsHeaders = {
     "Access-Control-Allow-Headers": "Content-Type",
 };
 
-Bun.serve({
-    port: 4000,
+const port = process.env.PORT || 4000;
+
+const server = Bun.serve({
+    port,
     async fetch(req) {
         if (req.method === "OPTIONS") {
             return new Response(null, { status: 204, headers: corsHeaders });
@@ -46,8 +48,8 @@ Bun.serve({
             }
 
             try {
-                await stopRecording(body.roomId);
-                return new Response(JSON.stringify({ message: "Recording stopped" }), {
+                const outputName = await stopRecording(body.roomId);
+                return new Response(JSON.stringify({ message: "Recording stopped", outputName }), {
                     status: 200,
                     headers: { "Content-Type": "application/json", ...corsHeaders }
                 });
@@ -59,6 +61,43 @@ Bun.serve({
             }
         }
 
+        if (req.method === "GET" && new URL(req.url).pathname.startsWith("/progress/")) {
+            const egressId = new URL(req.url).pathname.split("/").pop();
+            if (!egressId) {
+                return new Response(JSON.stringify({ error: "Missing egress ID" }), {
+                    status: 400,
+                    headers: { "Content-Type": "application/json", ...corsHeaders }
+                });
+            }
+
+            // Using dynamic import or direct import if we exported the progress map
+            // Since bun allows caching we can just import the map
+            const { extractionProgress } = await import("./recorder");
+
+            const state = extractionProgress.get(egressId);
+            if (!state) {
+                return new Response(JSON.stringify({ status: "UNKNOWN", progress: 0 }), {
+                    status: 200,
+                    headers: { "Content-Type": "application/json", ...corsHeaders }
+                });
+            }
+
+            return new Response(JSON.stringify(state), {
+                status: 200,
+                headers: { "Content-Type": "application/json", ...corsHeaders }
+            });
+        }
+
         return new Response("Not found", { status: 404, headers: corsHeaders });
     }
 });
+
+console.log(`
+===================================================
+        Recorder Service Started Successfully
+===================================================
+Running on port : ${server.port}
+Local URL       : http://localhost:${server.port}
+Started at      : ${new Date().toLocaleString()}
+===================================================
+`);
